@@ -85,8 +85,26 @@ El bloque de conteo por conexión de `EVG-CALIBRA` usa **arrays asociativos** de
 RouterOS (`($arr->clave)` y `:foreach k,v in=...`), que funcionan en RouterOS 7
 pero **no pude probarlos en un equipo real** desde aquí. Aplicá con el
 procedimiento seguro de la cabecera (export, BYPASS, revisar `EVG-AUDIT` a los 5
-min) y mirá `/log print where message~"EVG-CALIBRA"`. Si tu versión de ROS se
-queja del conteo, se puede simplificar a una variante sin arrays asociativos.
+min) y mirá `/log print where message~"EVG-CALIBRA"`.
+
+### Variante COMPAT (sin arrays asociativos) — `EVG-CALIBRA-compat.rsc`
+Por si tu versión/build de ROS se queja de esos constructos, se incluye un
+**reemplazo drop-in** que hace lo mismo sin `->` ni `:foreach k,v`:
+
+- **Umbral de conexiones:** por realimentación de la lista `CPE-CONNFLOOD` (sin
+  escanear conexiones): si hay clientes legítimos flagged, sube; si no hay
+  ninguno, baja suave hacia el piso. Acotado y leído de la regla.
+- **Proxy:** contador por equipo guardado en el `comment` de una lista temporal.
+- **DoT:** contador por destino en el `comment`. En compat cuenta **conexiones**
+  al resolver (aproximación), no clientes distintos — el efecto es solo sobre
+  una lista de detección (el bloqueo OPT-DOT está apagado). También podés
+  promover a mano desde `CENSO-DOT`.
+- **EVG-NO-AUTOBLOCK** y **corroboración 6969:** idénticos (no usaban arrays).
+
+**Uso:** aplicar primero `EVG-FW2026-v7.14.rsc` completo y **después** pegar
+`EVG-CALIBRA-compat.rsc` (quita el `EVG-CALIBRA` normal, instala la variante, la
+agenda cada hora y la corre una vez). Para volver a la versión normal, reaplicar
+el `.rsc` principal.
 
 ## Qué revisar tras aplicar
 ```
