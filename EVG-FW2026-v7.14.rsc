@@ -1,6 +1,72 @@
 # ============================================================================
-# EVG-FW2026 | PLANTILLA FIREWALL ISP  (RouterOS 7.x)  --  GENERICA  v7.13
+# EVG-FW2026 | PLANTILLA FIREWALL ISP  (RouterOS 7.x)  --  GENERICA  v7.14
 # ============================================================================
+#
+# ----------------------------------------------------------------------------
+#  MEJORAS v7.14 SOBRE v7.13  -- menos falsos positivos + autocalibracion
+#
+#  El objetivo de esta version es doble: (1) que las detecciones NO marquen
+#  trafico legitimo, y (2) que los umbrales de "trafico valido" se ajusten
+#  SOLOS a lo que es normal en ESTA red, en vez de un numero fijo que
+#  siempre queda corto en un lado y largo en el otro.
+#
+#  --- MENOS FALSOS POSITIVOS ---
+#
+#  [FP-01] *** 6969 (BitTorrent) YA NO SE MARCA COMO "INFECCION CONFIRMADA" ***
+#          El 6969 es a la vez la firma de Hajime Y un puerto legitimo de
+#          tracker BitTorrent. En v7.13 caia en CPE-INFECTADO junto al
+#          sinkhole y el honeypot, ensuciando la lista que el script jura
+#          que "no es heuristica".
+#          v7.14: 48101 y 58455 (exclusivos de Mirai) siguen CONFIRMADOS.
+#          El 6969 va a CPE-MIRAI-SOSPECHA (para revisar), NO a CPE-INFECTADO.
+#          El drop del 6969 se mantiene (frena la emision y el listado XBL),
+#          pero solo se ESCALA a confirmado si el mismo equipo aparece en
+#          otra señal dura (sinkhole, honeypot u otro puerto Mirai). Esa
+#          correlacion la hace EVG-CALIBRA.
+#
+#  [FP-02] *** DoT: se aprende que resolver es legitimo por CONSENSO ***
+#          La lista DNS-OK era corta; un cliente con un resolver DoT valido
+#          pero no listado caia en CPE-DOT-RARO. Un C2 lo usa UN bot; un
+#          resolver legitimo lo usan MUCHOS clientes. v7.14 amplia DNS-OK y
+#          EVG-CALIBRA promueve a DNS-OK cualquier destino :853 usado por
+#          >= EVGDOTMINCLIENTES clientes distintos. Deja de marcarlos.
+#
+#  [FP-03] *** LA INFRA DE CONFIANZA NO SE AUTOBLOQUEA POR SPOOFING ***
+#          El origen de un paquete se falsifica: alguien manda un paquete con
+#          src=8.8.8.8 al 445 y el detector honeypot te autobloquea tu propio
+#          resolver, gateway o peer BGP. v7.14 agrega la lista
+#          EVG-NO-AUTOBLOCK (union de GATEWAYS, BGP-PEERS, DNS-OK, IP-PUBLICA
+#          y WAN-PRIVADA) y los detectores de INPUT ya NO agregan a esas IP.
+#
+#  [FP-04] *** EL DETECTOR DE PROXY YA NO CONFUNDE VIDEOLLAMADAS ***
+#          Una videollamada (Zoom, Meet, WhatsApp) es UN flujo grande y
+#          simetrico -- y en v7.13 se marcaba como proxy. Un proxy real
+#          relaya MUCHOS flujos simetricos a la vez. v7.14 cuenta los flujos
+#          simetricos POR EQUIPO y solo marca al que tiene >= EVGPROXYMINFLOWS
+#          (default 4); ademas sube el minimo de bytes y aprieta el factor.
+#
+#  --- AUTOCALIBRACION ---
+#
+#  [NEW-09] *** EVG-CALIBRA: los umbrales se ajustan a la red  [SECCION 9.9] ***
+#          Todos los umbrales que afectan a clientes pasan a variables
+#          globales con piso y techo. EVG-CALIBRA mide en UNA pasada:
+#            - el cliente mas ocupado -> fija el umbral de conexiones
+#              concurrentes (6B.5) en 2x lo observado, acotado a
+#              [EVGCONNFLOORMIN, EVGCONNFLOORMAX]. Solo sube, o baja con
+#              histeresis, para no oscilar.
+#            - los destinos DoT populares -> DNS-OK (FP-02)
+#            - los equipos con muchos flujos simetricos -> CPE-PROXY (FP-04)
+#            - correlaciona CPE-MIRAI-SOSPECHA con señales duras (FP-01)
+#          Es SEGURO: el drop de conexiones (6B.5) sigue deshabilitado, asi
+#          que auto-ajustar ese umbral solo cambia una lista de deteccion,
+#          nunca corta a un cliente. Todo queda acotado por piso/techo, asi
+#          que un error no puede poner el umbral en 0 (bloquear todo) ni en
+#          infinito (no detectar nada). Reemplaza al viejo EVG-PROXY.
+#
+#  NOTA DE COSTO: EVG-CALIBRA recorre la tabla de conexiones una vez por
+#  hora (igual que hacia EVG-PROXY). Si la caja maneja MUCHISIMAS conexiones
+#  se autolimita: por encima de EVGCONNMAXSCAN omite el conteo pesado y solo
+#  avisa. Subir el intervalo o EVGCONNMAXSCAN si hace falta.
 #
 # ----------------------------------------------------------------------------
 #  CORRECCIONES v7.13 SOBRE v7.12  -- bugs de logica encontrados en revision
@@ -280,14 +346,14 @@
 #      (caso 30.30.0.0/16), declararlo o la deteccion se ensucia
 # ----------------------------------------------------------------------------
 # APLICACION SEGURA:
-#   1) /export file=antes-v713
+#   1) /export file=antes-v714
 #   2) Pega el script. Activa el bypass:
 #        /ip firewall filter enable [find where comment~"BYPASS"]
 #   3) Verifica acceso. EVG-AUTO-OFF-BYPASS lo apaga en 5 min.
 #   4) A los 5 MINUTOS:  /log print where message~"EVG-AUDIT"
 # ============================================================================
 
-:log warning "EVG-FW2026: INICIO APLICACION (v7.13)"
+:log warning "EVG-FW2026: INICIO APLICACION (v7.14)"
 
 # ============================================================================
 # HELPER: ADDONCE
@@ -305,6 +371,60 @@
 # VARIABLE GLOBAL: PUERTO DE WINBOX
 # ============================================================================
 :global EVGWINBOX 8291
+
+# ============================================================================
+# VARIABLES GLOBALES: UMBRALES DE TRAFICO VALIDO  [NEW-09]
+# ============================================================================
+#  Todos los umbrales que pueden marcar a un cliente estan aqui, en un solo
+#  lugar, con piso y techo. EVG-CALIBRA (SECCION 9.9) los ajusta SOLO a lo
+#  que es normal en esta red, siempre dentro de [piso, techo].
+#
+#  Por que globales: asi el valor "aprendido" sobrevive y las reglas se
+#  crean con el mismo numero que luego ajusta el calibrador.
+#
+#  *** Si preferis fijarlos a mano, poné el valor y listo: EVG-CALIBRA
+#      respeta el techo y el piso, y podés desactivar su scheduler. ***
+
+# --- Conexiones concurrentes por cliente en FORWARD (deteccion 6B.5) -------
+# Arranca en 800 (un hogar SANO se midio en 224). El calibrador lo lleva a
+# 2x el cliente mas ocupado, acotado al rango de abajo. Como el DROP de
+# 6B.5 esta deshabilitado, mover este umbral NUNCA corta a nadie: solo
+# cambia una lista de deteccion.
+:global EVGCONNFLOOD 800
+:global EVGCONNFLOORMIN 400
+:global EVGCONNFLOORMAX 4000
+
+# --- Conexiones por IP HACIA el router (INPUT 5.1b) ------------------------
+# Proteccion del router (borde ISP con BGP = 500). No se autoajusta por
+# defecto; cambiar aca si el rol es distinto (core = 1000+).
+:global EVGINPUTCONN 500
+
+# --- SYN nuevos por segundo hacia el router (SYN-PROT, SECCION 8) ----------
+:global EVGSYN 400
+
+# --- Brute-force ADMIN saliente por cliente (EVG-EGRESS-BF, 6.7) -----------
+# Es por SEGUNDO (el /1m es la expiracion del contador). 10/s de conexiones
+# nuevas a SSH/Telnet/RDP/VNC ya es claramente brute-force, con FP bajo.
+:global EVGEGRESSBF 10
+
+# --- Deteccion de proxy por simetria (EVG-CALIBRA, ex EVG-PROXY) -----------
+# minMB : tamaño minimo de cada sentido para considerar el flujo (40 MB, asi
+#         una videollamada corta no cuenta).
+# factor: se marca si menor*factor > mayor. factor=2 => hay que ser MUY
+#         simetrico (ratio > 0.5), como un relay; una descarga es asimetrica.
+# minFlows: cuantos flujos grandes y simetricos A LA VEZ. Una videollamada
+#         es 1; un proxy relaya varios. Este es el filtro clave contra FP.
+:global EVGPROXYMINMB 40
+:global EVGPROXYFACTOR 2
+:global EVGPROXYMINFLOWS 4
+
+# --- DoT: cuantos clientes distintos vuelven "legitimo" a un resolver -----
+:global EVGDOTMINCLIENTES 5
+
+# --- Tope de conexiones para el escaneo del calibrador --------------------
+# Si la tabla supera esto, EVG-CALIBRA omite el conteo pesado y solo avisa,
+# para no clavar la CPU en una caja muy cargada.
+:global EVGCONNMAXSCAN 60000
 
 :local wbactual [/ip service get [find name=winbox] port]
 :if ($wbactual != $EVGWINBOX) do={
@@ -341,11 +461,11 @@
 :foreach r in=[find where comment~"FW-HARDENED"] do={ remove $r }
 
 /system scheduler
-:foreach n in={"EVG-POPULATE";"EVG-UPDATE-SPAMHAUS";"EVG-AUTO-OFF-BYPASS";"EVG-QUARANTINE-REPORT";"EVG-AUDIT";"EVG-PROXY";"EVG-AUDIT-EXPOSICION";"EVG-RBL-CHECK";"EVG-DESCUBRE"} do={
+:foreach n in={"EVG-POPULATE";"EVG-UPDATE-SPAMHAUS";"EVG-AUTO-OFF-BYPASS";"EVG-QUARANTINE-REPORT";"EVG-AUDIT";"EVG-PROXY";"EVG-CALIBRA";"EVG-AUDIT-EXPOSICION";"EVG-RBL-CHECK";"EVG-DESCUBRE"} do={
   :if ([:len [find name=$n]] > 0) do={ remove [find name=$n] }
 }
 /system script
-:foreach n in={"EVG-POPULATE";"EVG-UPDATE-SPAMHAUS";"EVG-AUTO-OFF-BYPASS";"EVG-QUARANTINE-REPORT";"EVG-AUDIT";"EVG-PROXY";"EVG-AUDIT-EXPOSICION";"EVG-RBL-CHECK";"EVG-DESCUBRE"} do={
+:foreach n in={"EVG-POPULATE";"EVG-UPDATE-SPAMHAUS";"EVG-AUTO-OFF-BYPASS";"EVG-QUARANTINE-REPORT";"EVG-AUDIT";"EVG-PROXY";"EVG-CALIBRA";"EVG-AUDIT-EXPOSICION";"EVG-RBL-CHECK";"EVG-DESCUBRE"} do={
   :if ([:len [find name=$n]] > 0) do={ remove [find name=$n] }
 }
 
@@ -403,6 +523,21 @@ add address=45.90.28.0/24    list=DNS-OK comment="EVG-FW2026 | NextDNS"
 add address=45.90.30.0/24    list=DNS-OK comment="EVG-FW2026 | NextDNS"
 add address=208.67.222.222   list=DNS-OK comment="EVG-FW2026 | OpenDNS"
 add address=208.67.220.220   list=DNS-OK comment="EVG-FW2026 | OpenDNS"
+# [FP-02] Ampliada: mas resolvers DoT/DoH conocidos, para no marcar como
+# "raro" a un cliente que usa uno legitimo pero que antes no estaba.
+add address=1.1.1.2          list=DNS-OK comment="EVG-FW2026 | Cloudflare Malware"
+add address=1.0.0.2          list=DNS-OK comment="EVG-FW2026 | Cloudflare Malware"
+add address=1.1.1.3          list=DNS-OK comment="EVG-FW2026 | Cloudflare Family"
+add address=1.0.0.3          list=DNS-OK comment="EVG-FW2026 | Cloudflare Family"
+add address=9.9.9.11         list=DNS-OK comment="EVG-FW2026 | Quad9 ECS"
+add address=149.112.112.11   list=DNS-OK comment="EVG-FW2026 | Quad9 ECS"
+add address=194.242.2.2      list=DNS-OK comment="EVG-FW2026 | Mullvad"
+add address=193.110.81.0/24  list=DNS-OK comment="EVG-FW2026 | dns0.eu"
+add address=185.253.5.0/24   list=DNS-OK comment="EVG-FW2026 | dns0.eu"
+add address=76.76.2.0/24     list=DNS-OK comment="EVG-FW2026 | ControlD"
+add address=76.76.10.0/24    list=DNS-OK comment="EVG-FW2026 | ControlD"
+# EVG-CALIBRA (9.9) agrega aqui, con timeout, los resolvers :853 que usan
+# muchos clientes de la propia red (consenso = legitimo).
 
 # --- 2.6 SINKHOLES DE INVESTIGACION  *** NO SON PARA BLOQUEAR ***  [NEW-01]
 #
@@ -517,6 +652,15 @@ $ADDONCE "127.0.0.1" "GATEWAYS" "EVG-GATEWAY-DATA | placeholder NO BORRAR"
 # agregarlo a mano:
 #$ADDONCE "200.1.1.1" "GATEWAYS" "EVG-GATEWAY-DATA | gateway WAN1 manual"
 
+# --- 2.14 EVG-NO-AUTOBLOCK: infra que NUNCA se autobloquea  [FP-03] ---------
+# El origen de un paquete se falsifica: sin esto, un paquete con src=8.8.8.8
+# al puerto 445 mete a tu propio resolver en PORT-SCAN. Esta lista es la
+# union de GATEWAYS + BGP-PEERS + DNS-OK + IP-PUBLICA + WAN-PRIVADA, y los
+# detectores de INPUT (5.1) NO agregan a estas IP. La puebla EVG-CALIBRA.
+# El placeholder garantiza que exista: con la lista VACIA, !EVG-NO-AUTOBLOCK
+# matchea TODO, o sea el detector funciona igual que antes (nadie exento).
+$ADDONCE "127.0.0.1" "EVG-NO-AUTOBLOCK" "EVG-FIJO placeholder NO BORRAR"
+
 # --- 2.12 BLACKLIST MANUAL -------------------------------------------------
 #$ADDONCE "1.2.3.4" "BLACKLIST" "abuso ssh 2026-08"
 
@@ -625,15 +769,20 @@ add action=drop chain=input src-address-list=PORT-SCAN comment="EVG-FW2026 | Dro
 # al puerto 445 y te autobloqueas Google. Con 1 dia el daño es acotado.
 # Si aparece un falso positivo raro, empezar a investigar por aqui:
 #   /ip firewall address-list print where list=PORT-SCAN
-add action=add-src-to-address-list chain=input protocol=tcp dst-port=21,23,111,135,139,445,1433,3306,5432,5900,6379,9200,11211,27017 in-interface-list=WAN address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector honeypot TCP"
-add action=add-src-to-address-list chain=input protocol=udp dst-port=111,137,161,177,389,520,623,1900,5060,11211 in-interface-list=WAN address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector honeypot UDP"
+# [FP-03] src-address-list=!EVG-NO-AUTOBLOCK: la infra propia (gateways,
+# peers BGP, resolvers, IP publicas, transito) NO entra a PORT-SCAN aunque
+# aparezca como origen -- el origen se falsifica y no queremos autobloquear
+# nuestro propio resolver por un paquete spoofeado. Con la lista vacia,
+# !EVG-NO-AUTOBLOCK matchea todo (mismo comportamiento que antes).
+add action=add-src-to-address-list chain=input protocol=tcp dst-port=21,23,111,135,139,445,1433,3306,5432,5900,6379,9200,11211,27017 in-interface-list=WAN src-address-list=!EVG-NO-AUTOBLOCK address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector honeypot TCP"
+add action=add-src-to-address-list chain=input protocol=udp dst-port=111,137,161,177,389,520,623,1900,5060,11211 in-interface-list=WAN src-address-list=!EVG-NO-AUTOBLOCK address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector honeypot UDP"
 
 # PSD tradicional como backup (scans horizontales verdaderos)
-add action=add-src-to-address-list chain=input protocol=tcp psd=40,10s,2,1 in-interface-list=WAN address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector port-scan PSD (backup)"
+add action=add-src-to-address-list chain=input protocol=tcp psd=40,10s,2,1 in-interface-list=WAN src-address-list=!EVG-NO-AUTOBLOCK address-list=PORT-SCAN address-list-timeout=1d comment="EVG-FW2026 | Detector port-scan PSD (backup)"
 
 # --- 5.1b LIMITE DE CONEXIONES  [FIX-35] -----------------------------------
 # El comentario de v7.6 decia 500 pero el valor era 1000. Unificado en 500.
-add action=drop chain=input connection-limit=500,32 in-interface-list=WAN protocol=tcp comment="EVG-FW2026 | Limite 500 conexiones por IP al router (borde ISP)"
+add action=drop chain=input connection-limit="$EVGINPUTCONN,32" in-interface-list=WAN protocol=tcp comment="EVG-FW2026 | Limite conexiones por IP al router (global EVGINPUTCONN)"
 
 # SYN-PROT
 add action=jump chain=input connection-state=new protocol=tcp tcp-flags=syn jump-target=SYN-PROT in-interface-list=WAN comment="EVG-FW2026 | Jump SYN-PROT"
@@ -796,7 +945,7 @@ add action=accept chain=forward protocol=tcp dst-port=3389 out-interface-list=WA
 add action=drop chain=forward protocol=tcp dst-port=21,22,23,2323,1723,3389,5900 out-interface-list=WAN src-address-list=CPE-BRUTEFORCE comment="EVG-FW2026 | Drop CPE detectado en brute-force saliente"
 
 add action=jump chain=forward jump-target=EVG-EGRESS-BF protocol=tcp dst-port=21,22,23,2323,1723,3389,5900 connection-state=new out-interface-list=WAN comment="EVG-FW2026 | Jump deteccion brute-force saliente"
-add action=return chain=EVG-EGRESS-BF dst-limit=10,10,src-address/1m comment="EVG-FW2026 | Bajo umbral por cliente -> normal"
+add action=return chain=EVG-EGRESS-BF dst-limit="$EVGEGRESSBF,$EVGEGRESSBF,src-address/1m" comment="EVG-FW2026 | Bajo umbral por cliente -> normal (global EVGEGRESSBF /s)"
 add action=add-src-to-address-list chain=EVG-EGRESS-BF address-list=CPE-BRUTEFORCE address-list-timeout=1d comment="EVG-FW2026 | Sobre umbral -> CPE-BRUTEFORCE"
 add action=return chain=EVG-EGRESS-BF comment="EVG-FW2026 | Return a forward"
 
@@ -867,10 +1016,29 @@ add action=drop chain=forward protocol=tcp dst-port=853 out-interface-list=WAN d
 #  razon: mientras esos SYN sigan saliendo, Spamhaus los ve y el listado en
 #  el XBL no expira, asi que los clientes del ISP siguen sin poder entrar a
 #  Disney ni a los bancos.
-add action=add-src-to-address-list chain=forward protocol=tcp dst-port=6969,48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS address-list=CPE-MIRAI-C2 address-list-timeout=30d comment="EVG-FW2026 | C2 Mirai: infeccion CONFIRMADA"
-add action=add-src-to-address-list chain=forward protocol=tcp dst-port=6969,48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS address-list=CPE-INFECTADO address-list-timeout=30d comment="EVG-FW2026 | C2 Mirai a lista general"
-add action=log chain=forward protocol=tcp dst-port=6969,48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS log-prefix="MIRAI-C2:" comment="EVG-FW2026 | Log C2 Mirai"
-add action=drop chain=forward protocol=tcp dst-port=6969,48101,58455 connection-state=new out-interface-list=WAN src-address-list=!SSH-ALLOWED comment="EVG-FW2026 | Drop C2 Mirai/Hajime"
+# [FP-01] DOS NIVELES DE CONFIANZA, porque el 6969 tiene doble uso:
+#
+#   48101 y 58455 son EXCLUSIVOS de Mirai -> infeccion CONFIRMADA.
+#   6969 es la firma de Hajime PERO tambien un tracker BitTorrent legitimo.
+#        Por si solo -> SOSPECHA (para revisar), NO CONFIRMADO. El drop se
+#        mantiene (frena la emision y evita el listado XBL, y romper un
+#        tracker BitTorrent es un daño menor), pero no se llama "infectado"
+#        a un equipo que quiza solo esta bajando un torrent.
+#
+#   EVG-CALIBRA escala 6969 a CONFIRMADO solo si el mismo equipo aparece en
+#   otra señal dura (sinkhole, honeypot, otro puerto Mirai, propagacion).
+
+# --- Nivel duro: 48101 / 58455 (exclusivos de Mirai) = CONFIRMADO ---
+add action=add-src-to-address-list chain=forward protocol=tcp dst-port=48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS address-list=CPE-MIRAI-C2 address-list-timeout=30d comment="EVG-FW2026 | C2 Mirai (48101/58455): infeccion CONFIRMADA"
+add action=add-src-to-address-list chain=forward protocol=tcp dst-port=48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS address-list=CPE-INFECTADO address-list-timeout=30d comment="EVG-FW2026 | C2 Mirai a lista general"
+add action=log chain=forward protocol=tcp dst-port=48101,58455 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS log-prefix="MIRAI-C2:" comment="EVG-FW2026 | Log C2 Mirai confirmado"
+
+# --- Nivel sospecha: 6969 (Hajime, pero tambien BitTorrent) = REVISAR ---
+add action=add-src-to-address-list chain=forward protocol=tcp dst-port=6969 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS address-list=CPE-MIRAI-SOSPECHA address-list-timeout=7d comment="EVG-FW2026 | 6969: Hajime O BitTorrent -> SOSPECHA (revisar, no confirmar)"
+add action=log chain=forward protocol=tcp dst-port=6969 connection-state=new out-interface-list=WAN dst-address-list=!EVG-INTERNAS log-prefix="MIRAI-6969:" comment="EVG-FW2026 | Log 6969 (sospecha)"
+
+# --- Drop de la emision (los tres puertos), salvo equipos autorizados ---
+add action=drop chain=forward protocol=tcp dst-port=6969,48101,58455 connection-state=new out-interface-list=WAN src-address-list=!SSH-ALLOWED comment="EVG-FW2026 | Drop C2 Mirai/Hajime (6969 puede afectar trackers BitTorrent)"
 
 # --- 6B.7 PROPAGACION LATERAL entre clientes  [NEW-04] --------------------
 #
@@ -886,8 +1054,11 @@ add action=add-src-to-address-list chain=forward protocol=tcp tcp-flags=syn,!ack
 # --- 6B.5 Exceso de conexiones ---------------------------------------------
 # Umbral 800, deliberadamente alto: en campo se midio un cliente domestico
 # SANO con 224 conexiones concurrentes.
-add action=add-src-to-address-list chain=forward connection-limit=800,32 connection-state=new in-interface-list=LAN address-list=CPE-CONNFLOOD address-list-timeout=1d comment="EVG-FW2026 | DETECTA exceso de conexiones"
-add action=drop chain=forward connection-limit=800,32 connection-state=new in-interface-list=LAN disabled=yes comment="EVG-FW2026 | OPT-CONEXIONES (calibrar umbral antes)"
+# [NEW-09] El umbral (global EVGCONNFLOOD) lo autoajusta EVG-CALIBRA a 2x el
+# cliente mas ocupado de esta red. Como el DROP de abajo esta deshabilitado,
+# mover el umbral solo cambia una lista de deteccion: nunca corta a nadie.
+add action=add-src-to-address-list chain=forward connection-limit="$EVGCONNFLOOD,32" connection-state=new in-interface-list=LAN address-list=CPE-CONNFLOOD address-list-timeout=1d comment="EVG-FW2026 | DETECTA exceso de conexiones (auto: EVGCONNFLOOD)"
+add action=drop chain=forward connection-limit="$EVGCONNFLOOD,32" connection-state=new in-interface-list=LAN disabled=yes comment="EVG-FW2026 | OPT-CONEXIONES (auto: EVGCONNFLOOD; revisar CPE-CONNFLOOD antes de activar)"
 
 # ============================================================================
 # SECCION 7 - OUTPUT
@@ -900,7 +1071,7 @@ add action=drop chain=output protocol=tcp dst-port=25 comment="EVG-FW2026 | Rout
 # SECCION 8 - CHAIN SYN-PROT
 # ============================================================================
 # El burst debe ser >= rate, o el balde se vacia en el primer instante.
-add action=return chain=SYN-PROT connection-state=new protocol=tcp tcp-flags=syn limit=400,400:packet comment="EVG-FW2026 | SYN bajo limite -> return"
+add action=return chain=SYN-PROT connection-state=new protocol=tcp tcp-flags=syn limit="$EVGSYN,$EVGSYN:packet" comment="EVG-FW2026 | SYN bajo limite -> return (global EVGSYN)"
 add action=drop chain=SYN-PROT connection-state=new protocol=tcp tcp-flags=syn comment="EVG-FW2026 | SYN sobre limite -> drop"
 
 # ============================================================================
@@ -1389,7 +1560,8 @@ add name=EVG-DESCUBRE owner=admin policy=read,write,test source={
 #  SQL y RDP a todos los clientes de un ISP.
 
 :foreach L in={"SMTP-ALLOWED";"SSH-ALLOWED";"RDP-ALLOWED";"DB-ALLOWED"; \
-               "EVG-EXENTOS";"HONEYPOT-INTERNO";"EVG-INTERNAS"} do={
+               "EVG-EXENTOS";"HONEYPOT-INTERNO";"EVG-INTERNAS"; \
+               "EVG-NO-AUTOBLOCK"} do={
   :if ([:len [/ip firewall address-list find where list=$L]] = 0) do={
     :do {
       /ip firewall address-list add list=$L address=127.0.0.1 \
@@ -1590,8 +1762,9 @@ add name=EVG-QUARANTINE-REPORT owner=admin policy=read,write,test source={
 :local h [:len [/ip firewall address-list find where list=CENSO-DOT]]
 :local i [:len [/ip firewall address-list find where list=CPE-MIRAI-C2]]
 :local j [:len [/ip firewall address-list find where list=CPE-IOT-LATERAL]]
+:local k [:len [/ip firewall address-list find where list=CPE-MIRAI-SOSPECHA]]
 :log warning ("EVG-REPORTE CONFIRMADOS (sinkhole/honeypot/C2): " . $a . "  <-- NO es heuristica, estan infectados")
-:log warning ("EVG-REPORTE | C2 Mirai=" . $i . " | propagacion lateral=" . $j)
+:log warning ("EVG-REPORTE | C2 Mirai(confirmado)=" . $i . " | 6969 SOSPECHA(revisar, puede ser BitTorrent)=" . $k . " | propagacion lateral=" . $j)
 :log warning ("EVG-REPORTE | IoT=" . $b . " bruteforce=" . $c . " proxy=" . $d . " DoT-raro=" . $e)
 :log warning ("EVG-REPORTE | SMTP=" . $f . " conexiones=" . $g . " censo-DoT=" . $h)
 :log warning ("=== FIN | CPE en seguimiento activos hoy=" . $total . " ===")
@@ -1601,50 +1774,227 @@ add name=EVG-QUARANTINE-REPORT owner=admin policy=read,write,test source={
 }
 
 # ============================================================================
-# --- 9.5 EVG-PROXY: deteccion de proxy residencial por SIMETRIA  [NEW-03]
+# --- 9.9 EVG-CALIBRA: autocalibracion + deteccion por simetria  [NEW-09]
 # ============================================================================
-#  Las botnets de TV box usan el CPE como proxy: el trafico entra y vuelve
-#  a salir, asi que sube y baja casi lo mismo.
+#  Reemplaza al viejo EVG-PROXY. En UNA sola pasada por la tabla de
+#  conexiones hace cuatro cosas, y ademas dos que no necesitan escanear:
 #
-#  *** POR QUE ESTO ES UN SCRIPT Y NO UNA REGLA ***
-#  connection-bytes y connection-rate miden el TOTAL de la conexion, no
-#  cada sentido. Una regla con esos matchers no detecta simetria: detecta
-#  "conexion grande", o sea Netflix. En campo dio 188 falsos positivos.
-#  RouterOS no tiene ningun matcher que compare orig-bytes con repl-bytes.
+#   1. UMBRAL DE CONEXIONES (6B.5): mide el cliente mas ocupado y fija el
+#      umbral en 2x eso, acotado a [EVGCONNFLOORMIN, EVGCONNFLOORMAX], con
+#      histeresis del 15% para no oscilar. Lee el valor ACTUAL de la regla
+#      (que persiste en config), asi sobrevive a un reboot. Como el DROP de
+#      6B.5 esta deshabilitado, esto solo cambia una lista de deteccion:
+#      NUNCA corta a un cliente.
 #
-#  REQUIERE FastTrack desactivado para ver los bytes reales.
-#  CALIBRAR: si da muchas entradas, subir minB o bajar factor de 3 a 2.
-add name=EVG-PROXY owner=admin policy=read,write,test source={
-:local minB 20000000
-:local factor 3
-:local nuevos 0
-:local grandes 0
-:foreach c in=[/ip firewall connection find where protocol="tcp"] do={
-  :do {
-    :local ob [/ip firewall connection get $c orig-bytes]
-    :local rb [/ip firewall connection get $c repl-bytes]
-    :if (($ob > $minB) and ($rb > $minB)) do={
-      :set grandes ($grandes + 1)
-      :local hi $ob
-      :local lo $rb
-      :if ($rb > $ob) do={ :set hi $rb; :set lo $ob }
-      :if (($lo * $factor) > $hi) do={
-        :local sa [/ip firewall connection get $c src-address]
-        :local ip $sa
-        :local pos [:find $sa ":"]
-        :if ([:typeof $pos] = "num") do={ :set ip [:pick $sa 0 $pos] }
-        :if ([:len [/ip firewall address-list find where list="CPE-PROXY" and address=$ip]] = 0) do={
-          :do {
-            /ip firewall address-list add list=CPE-PROXY address=$ip timeout=7d comment="EVG-PROXY-DATA simetrico"
-            :set nuevos ($nuevos + 1)
-            :log warning ("EVG-PROXY: posible proxy " . $ip . " sube=" . ($ob/1048576) . "MB baja=" . ($rb/1048576) . "MB")
-          } on-error={}
+#   2. PROXY POR SIMETRIA [FP-04]: cuenta, POR EQUIPO, cuantos flujos TCP
+#      grandes (> EVGPROXYMINMB cada sentido) y simetricos (menor*factor >
+#      mayor) hay a la vez. Una videollamada es 1 flujo -> no se marca. Un
+#      proxy relaya varios -> a CPE-PROXY solo con >= EVGPROXYMINFLOWS.
+#      (connection-bytes/rate no sirven: miden el total, no cada sentido.
+#      Requiere FastTrack desactivado para ver los bytes reales.)
+#
+#   3. DoT POR CONSENSO [FP-02]: cuenta clientes DISTINTOS por destino :853.
+#      Un C2 lo usa un bot; un resolver legitimo lo usan muchos. El destino
+#      con >= EVGDOTMINCLIENTES clientes pasa a DNS-OK (con timeout) y deja
+#      de caer en CPE-DOT-RARO.
+#      OJO: en una red MUY chica subir EVGDOTMINCLIENTES; 5 bots compartiendo
+#      un C2 podrian colarse. El bloqueo OPT-DOT esta apagado, asi que el
+#      unico efecto es sobre una lista de deteccion.
+#
+#   4. INFRA DE CONFIANZA [FP-03]: arma EVG-NO-AUTOBLOCK con la union de
+#      GATEWAYS + BGP-PEERS + DNS-OK + IP-PUBLICA + WAN-PRIVADA.
+#
+#   5. CORROBORACION 6969 [FP-01]: un equipo en CPE-MIRAI-SOSPECHA que
+#      tambien aparezca en una señal DURA (sinkhole/honeypot -> CPE-INFECTADO,
+#      o CPE-IOT-PROPAGA / CPE-IOT-LATERAL) se ESCALA a CONFIRMADO.
+#
+#  COSTO: si la tabla supera EVGCONNMAXSCAN, se omite el conteo pesado y
+#  solo se avisa, para no clavar la CPU. Corre cada hora.
+#
+add name=EVG-CALIBRA owner=admin policy=read,write,test source={
+# --- defaults reboot-safe: los globales se pierden en un reboot, aqui se
+#     re-siembran si faltan (la REGLA guarda el valor aprendido igual) ---
+:global EVGCONNFLOOD;      :if ([:typeof $EVGCONNFLOOD]      != "num") do={ :set EVGCONNFLOOD 800 }
+:global EVGCONNFLOORMIN;   :if ([:typeof $EVGCONNFLOORMIN]   != "num") do={ :set EVGCONNFLOORMIN 400 }
+:global EVGCONNFLOORMAX;   :if ([:typeof $EVGCONNFLOORMAX]   != "num") do={ :set EVGCONNFLOORMAX 4000 }
+:global EVGPROXYMINMB;     :if ([:typeof $EVGPROXYMINMB]     != "num") do={ :set EVGPROXYMINMB 40 }
+:global EVGPROXYFACTOR;    :if ([:typeof $EVGPROXYFACTOR]    != "num") do={ :set EVGPROXYFACTOR 2 }
+:global EVGPROXYMINFLOWS;  :if ([:typeof $EVGPROXYMINFLOWS]  != "num") do={ :set EVGPROXYMINFLOWS 4 }
+:global EVGDOTMINCLIENTES; :if ([:typeof $EVGDOTMINCLIENTES] != "num") do={ :set EVGDOTMINCLIENTES 5 }
+:global EVGCONNMAXSCAN;    :if ([:typeof $EVGCONNMAXSCAN]    != "num") do={ :set EVGCONNMAXSCAN 60000 }
+
+:local minB ($EVGPROXYMINMB * 1048576)
+:local factor $EVGPROXYFACTOR
+:log info "EVG-CALIBRA: inicio"
+
+# ---- (4) EVG-NO-AUTOBLOCK: union de infra de confianza  [FP-03] ----------
+/ip firewall address-list remove [find where list="EVG-NO-AUTOBLOCK" and comment~"EVG-AUTO"]
+:foreach L in={"GATEWAYS";"BGP-PEERS";"DNS-OK";"IP-PUBLICA";"WAN-PRIVADA"} do={
+  :foreach e in=[/ip firewall address-list find where list=$L] do={
+    :do {
+      :local ad [/ip firewall address-list get $e address]
+      :if ($ad != "127.0.0.1") do={
+        :if ([:len [/ip firewall address-list find where list="EVG-NO-AUTOBLOCK" and address=$ad]] = 0) do={
+          /ip firewall address-list add list="EVG-NO-AUTOBLOCK" address=$ad comment="EVG-AUTO union infra"
         }
       }
+    } on-error={}
+  }
+}
+
+# ---- (5) correlacion 6969: escalar SOSPECHA a CONFIRMADO  [FP-01] ---------
+:local escalados 0
+:foreach s in=[/ip firewall address-list find where list="CPE-MIRAI-SOSPECHA"] do={
+  :do {
+    :local ip [/ip firewall address-list get $s address]
+    :local dura false
+    :foreach L in={"CPE-INFECTADO";"CPE-IOT-PROPAGA";"CPE-IOT-LATERAL"} do={
+      :if ([:len [/ip firewall address-list find where list=$L and address=$ip]] > 0) do={ :set dura true }
+    }
+    :if ($dura) do={
+      :if ([:len [/ip firewall address-list find where list="CPE-INFECTADO" and address=$ip]] = 0) do={
+        :do { /ip firewall address-list add list=CPE-INFECTADO address=$ip timeout=30d comment="EVG-CALIBRA 6969 corroborado por señal dura" } on-error={}
+      }
+      :if ([:len [/ip firewall address-list find where list="CPE-MIRAI-C2" and address=$ip]] = 0) do={
+        :do { /ip firewall address-list add list=CPE-MIRAI-C2 address=$ip timeout=30d comment="EVG-CALIBRA 6969 corroborado" } on-error={}
+      }
+      :log warning ("EVG-CALIBRA: 6969 CORROBORADO -> " . $ip . " (aparece en señal dura) -> CONFIRMADO")
+      :set escalados ($escalados + 1)
     }
   } on-error={}
 }
-:log info ("EVG-PROXY: conexiones grandes=" . $grandes . " nuevos=" . $nuevos)
+
+# ---- pasada unica por conexiones: (1) conteo por src, (2) proxy, (3) DoT --
+:local nConn [:len [/ip firewall connection find]]
+:if ($nConn > $EVGCONNMAXSCAN) do={
+  :log warning ("EVG-CALIBRA: " . $nConn . " conexiones (> EVGCONNMAXSCAN=" . $EVGCONNMAXSCAN . "). Se OMITE el conteo pesado para no clavar la CPU. Subir el intervalo/tope o fijar EVGCONNFLOOD a mano.")
+} else={
+  :local cnt [:toarray ""]
+  :local flows [:toarray ""]
+  :local dotcount [:toarray ""]
+  :local dotseen [:toarray ""]
+
+  :foreach c in=[/ip firewall connection find] do={
+    :do {
+      :local sa [:tostr [/ip firewall connection get $c src-address]]
+      :local cp [:find $sa ":"]
+      :local ip $sa
+      :if ([:typeof $cp] = "num") do={ :set ip [:pick $sa 0 $cp] }
+      :local ipa [:toip $ip]
+      :if ([:typeof $ipa] = "ip") do={
+        # (1) conteo de conexiones por cliente interno
+        :local interno false
+        :if ($ipa in 10.0.0.0/8)     do={ :set interno true }
+        :if ($ipa in 172.16.0.0/12)  do={ :set interno true }
+        :if ($ipa in 192.168.0.0/16) do={ :set interno true }
+        :if ($ipa in 100.64.0.0/10)  do={ :set interno true }
+        :if ($interno) do={
+          :local cur ($cnt->$ip)
+          :if ([:typeof $cur] = "nothing") do={ :set cur 0 }
+          :set ($cnt->$ip) ($cur + 1)
+        }
+        :if ([:tostr [/ip firewall connection get $c protocol]] = "tcp") do={
+          # (2) proxy por simetria: contar flujos grandes y simetricos por src
+          :local ob [/ip firewall connection get $c orig-bytes]
+          :local rb [/ip firewall connection get $c repl-bytes]
+          :if (($ob > $minB) and ($rb > $minB)) do={
+            :local hi $ob
+            :local lo $rb
+            :if ($rb > $ob) do={ :set hi $rb; :set lo $ob }
+            :if (($lo * $factor) > $hi) do={
+              :local curf ($flows->$ip)
+              :if ([:typeof $curf] = "nothing") do={ :set curf 0 }
+              :set ($flows->$ip) ($curf + 1)
+            }
+          }
+          # (3) DoT: clientes distintos por destino :853
+          :local da [:tostr [/ip firewall connection get $c dst-address]]
+          :local dcp [:find $da ":"]
+          :if ([:typeof $dcp] = "num") do={
+            :local dip [:pick $da 0 $dcp]
+            :local dpt [:pick $da ($dcp + 1) [:len $da]]
+            :if ($dpt = "853") do={
+              :local pair ($dip . "|" . $ip)
+              :if ([:typeof ($dotseen->$pair)] = "nothing") do={
+                :set ($dotseen->$pair) true
+                :local curd ($dotcount->$dip)
+                :if ([:typeof $curd] = "nothing") do={ :set curd 0 }
+                :set ($dotcount->$dip) ($curd + 1)
+              }
+            }
+          }
+        }
+      }
+    } on-error={}
+  }
+
+  # --- (1) umbral de conexiones: cliente mas ocupado ---
+  :local busy 0
+  :local busyip ""
+  :foreach k,v in=$cnt do={
+    :if ($v > $busy) do={ :set busy $v; :set busyip $k }
+  }
+  # leer el umbral ACTUAL desde la regla (persiste en config, sobrevive reboot)
+  :local actual $EVGCONNFLOORMIN
+  :do {
+    :local s [:tostr [/ip firewall filter get [find where comment~"DETECTA exceso de conexiones"] connection-limit]]
+    :local com [:find $s ","]
+    :if ([:typeof $com] = "num") do={ :set actual [:tonum [:pick $s 0 $com]] }
+  } on-error={}
+  :local target ($busy * 2)
+  :if ($target < $EVGCONNFLOORMIN) do={ :set target $EVGCONNFLOORMIN }
+  :if ($target > $EVGCONNFLOORMAX) do={ :set target $EVGCONNFLOORMAX }
+  :local dif ($target - $actual)
+  :if ($dif < 0) do={ :set dif (0 - $dif) }
+  :local paso (($actual * 15) / 100)
+  :if ($dif > $paso) do={
+    :set EVGCONNFLOOD $target
+    :do { /ip firewall filter set [find where comment~"DETECTA exceso de conexiones"] connection-limit=("$target,32") } on-error={}
+    :do { /ip firewall filter set [find where comment~"OPT-CONEXIONES"] connection-limit=("$target,32") } on-error={}
+    :log warning ("EVG-CALIBRA: umbral de conexiones " . $actual . " -> " . $target . " (cliente top " . $busyip . " con " . $busy . " conexiones)")
+  } else={
+    :set EVGCONNFLOOD $actual
+    :log info ("EVG-CALIBRA: umbral de conexiones se mantiene en " . $actual . " (cliente top " . $busy . ")")
+  }
+
+  # --- (2) proxies: >= EVGPROXYMINFLOWS flujos grandes simetricos ---
+  :local nProxy 0
+  :foreach k,v in=$flows do={
+    :if ($v >= $EVGPROXYMINFLOWS) do={
+      :if ([:len [/ip firewall address-list find where list="CPE-PROXY" and address=$k]] = 0) do={
+        :do {
+          /ip firewall address-list add list=CPE-PROXY address=$k timeout=7d comment=("EVG-PROXY-DATA " . $v . " flujos simetricos")
+          :set nProxy ($nProxy + 1)
+          :log warning ("EVG-CALIBRA: posible proxy " . $k . " con " . $v . " flujos grandes simetricos a la vez")
+        } on-error={}
+      }
+    }
+  }
+
+  # --- (3) DoT por consenso: destino usado por muchos clientes -> DNS-OK ---
+  :local nDot 0
+  :foreach k,v in=$dotcount do={
+    :if ($v >= $EVGDOTMINCLIENTES) do={
+      :if ([:len [/ip firewall address-list find where list="DNS-OK" and address=$k]] = 0) do={
+        :do {
+          /ip firewall address-list add list=DNS-OK address=$k timeout=30d comment=("EVG-AUTO DoT consenso " . $v . " clientes")
+          :set nDot ($nDot + 1)
+          :log info ("EVG-CALIBRA: DoT " . $k . " usado por " . $v . " clientes distintos -> DNS-OK")
+        } on-error={}
+      } else={
+        :do {
+          :foreach e in=[/ip firewall address-list find where list="DNS-OK" and address=$k and comment~"EVG-AUTO"] do={
+            /ip firewall address-list set $e timeout=30d
+          }
+        } on-error={}
+      }
+    }
+  }
+
+  :log info ("EVG-CALIBRA: conexiones=" . $nConn . " proxies-nuevos=" . $nProxy . " DoT-consenso=" . $nDot)
+}
+
+:log warning ("EVG-CALIBRA: fin | umbral-conexiones=" . $EVGCONNFLOOD . " | 6969-escalados=" . $escalados . " | no-autobloqueo=" . [:len [/ip firewall address-list find where list="EVG-NO-AUTOBLOCK"]])
 }
 
 # ============================================================================
@@ -1754,6 +2104,27 @@ add name=EVG-AUDIT owner=admin policy=read,write,test source={
 :local sh [:len [/ip firewall address-list find where list="SPAMHAUS-DROP"]]
 :if (($sh > 0) and ($sh < 300)) do={
   :log error ("EVG-AUDIT: FALLA -- SPAMHAUS-DROP tiene solo " . $sh . " entradas. Descarga incompleta: puede estar bloqueando rangos equivocados.")
+  :set fallas ($fallas + 1)
+}
+
+# G4. Umbral autocalibrado de conexiones dentro de un rango sensato  [NEW-09]
+#     Si EVG-CALIBRA por un bug lo puso en 0 (bloquearia todo si se activa el
+#     OPT) o en un valor absurdo, avisar. Se lee de la propia regla.
+:do {
+  :local s [:tostr [/ip firewall filter get [find where comment~"DETECTA exceso de conexiones"] connection-limit]]
+  :local com [:find $s ","]
+  :if ([:typeof $com] = "num") do={
+    :local val [:tonum [:pick $s 0 $com]]
+    :if (($val < 100) or ($val > 8000)) do={
+      :log error ("EVG-AUDIT: FALLA -- umbral de conexiones (6B.5) en " . $val . ", fuera de rango sensato [100..8000]. Revisar EVG-CALIBRA o fijar EVGCONNFLOOD a mano.")
+      :set fallas ($fallas + 1)
+    }
+  }
+} on-error={}
+
+# G5. EVG-NO-AUTOBLOCK no debe contener 0.0.0.0/0 (dejaria ciego al detector)
+:if ([:len [/ip firewall address-list find where list="EVG-NO-AUTOBLOCK" and address="0.0.0.0/0"]] > 0) do={
+  :log error "EVG-AUDIT: FALLA -- EVG-NO-AUTOBLOCK contiene 0.0.0.0/0: el detector honeypot de INPUT quedaria desactivado. Quitar esa entrada."
   :set fallas ($fallas + 1)
 }
 
@@ -2094,7 +2465,7 @@ add name=EVG-POPULATE on-event=EVG-POPULATE interval=10m start-time=startup poli
 add name=EVG-UPDATE-SPAMHAUS on-event=EVG-UPDATE-SPAMHAUS interval=1d start-time=startup policy=read,write,test,reboot comment="EVG-FW2026 | Spamhaus diario"
 add name=EVG-AUTO-OFF-BYPASS on-event=EVG-AUTO-OFF-BYPASS interval=5m start-time=startup policy=read,write,test comment="EVG-FW2026 | Auto-off bypass 5m"
 add name=EVG-QUARANTINE-REPORT on-event=EVG-QUARANTINE-REPORT interval=1d start-time=08:00:00 policy=read,write,test comment="EVG-FW2026 | Reporte diario 8am"
-add name=EVG-PROXY on-event=EVG-PROXY interval=15m start-time=startup policy=read,write,test comment="EVG-FW2026 | Deteccion de proxy por simetria"
+add name=EVG-CALIBRA on-event=EVG-CALIBRA interval=1h start-time=startup policy=read,write,test comment="EVG-FW2026 | Autocalibracion de umbrales + proxy/DoT/6969 (ex EVG-PROXY)"
 add name=EVG-AUDIT on-event=EVG-AUDIT interval=1h start-time=startup policy=read,write,test comment="EVG-FW2026 | AUTODIAGNOSTICO"
 add name=EVG-AUDIT-EXPOSICION on-event=EVG-AUDIT-EXPOSICION interval=6h start-time=startup policy=read,write,test comment="EVG-FW2026 | Auditoria de exposicion dst-nat"
 add name=EVG-RBL-CHECK on-event=EVG-RBL-CHECK interval=1d start-time=06:00:00 policy=read,write,test,policy comment="EVG-FW2026 | Consulta de listas negras 6am"
@@ -2159,6 +2530,7 @@ add action=drop chain=forward connection-state=new in-interface-list=WAN disable
 # listas que puebla. Si corre despues, todo cuenta cero.
 /system script run EVG-DESCUBRE
 /system script run EVG-POPULATE
+/system script run EVG-CALIBRA
 /system script run EVG-UPDATE-SPAMHAUS
 /system script run EVG-AUDIT
 /system script run EVG-AUDIT-EXPOSICION
@@ -2181,9 +2553,9 @@ add action=drop chain=forward connection-state=new in-interface-list=WAN disable
 :local aC2  [:len [/ip firewall address-list find where list=CPE-MIRAI-C2]]
 :local aIn  [:len [/ip firewall address-list find where list=EVG-INTERNAS]]
 
-:log warning ("EVG-FW2026 v7.13: REGLAS | IN=" . $rIn . " FWD=" . $rFw . " OUT=" . $rOut . " SYN=" . $rSyn . " EGRESS-BF=" . $rBf . " RAW=" . $rRaw . " V6f=" . $rV6f . " V6r=" . $rV6r)
-:log warning ("EVG-FW2026 v7.13: ENTORNO | LAN=" . $nL . " WAN=" . $nW . " | drops activos en forward=" . $dAct . " | CPE-QUARANTINE=" . $aQ . " HONEYPOT=" . $aHp . " C2-Mirai=" . $aC2 . " rangos-internos=" . ($aIn - 1))
-:log warning "EVG-FW2026: APLICACION COMPLETADA (v7.13). Revisar: /log print where message~\"EVG-AUDIT\""
+:log warning ("EVG-FW2026 v7.14: REGLAS | IN=" . $rIn . " FWD=" . $rFw . " OUT=" . $rOut . " SYN=" . $rSyn . " EGRESS-BF=" . $rBf . " RAW=" . $rRaw . " V6f=" . $rV6f . " V6r=" . $rV6r)
+:log warning ("EVG-FW2026 v7.14: ENTORNO | LAN=" . $nL . " WAN=" . $nW . " | drops activos en forward=" . $dAct . " | CPE-QUARANTINE=" . $aQ . " HONEYPOT=" . $aHp . " C2-Mirai=" . $aC2 . " rangos-internos=" . ($aIn - 1))
+:log warning "EVG-FW2026: APLICACION COMPLETADA (v7.14). Revisar: /log print where message~\"EVG-AUDIT\""
 
 # ============================================================================
 # NOTA-LAN: SI LOS CLIENTES ENTRAN POR VLANs
@@ -2310,10 +2682,19 @@ add action=drop chain=forward connection-state=new in-interface-list=WAN disable
 #            activar OPT-DOT
 #   [ ] /log print where message~"EVG-PROXY"
 #   [ ] /ip firewall address-list print where list=CPE-MIRAI-C2
-#         -> C2 de Mirai/Hajime. Es lo que Spamhaus reporta como elf.mirai.
-#            Confirmados, sin heuristica.
+#         -> C2 de Mirai/Hajime (48101/58455). Confirmados, sin heuristica.
+#   [ ] /ip firewall address-list print where list=CPE-MIRAI-SOSPECHA
+#         -> [FP-01] emisiones al 6969: Hajime O tracker BitTorrent. REVISAR,
+#            no es confirmado. EVG-CALIBRA lo escala solo si ademas aparece
+#            en una señal dura.
 #   [ ] /ip firewall address-list print where list=CPE-IOT-LATERAL
 #         -> escaneo ENTRE clientes. El borde normalmente no lo ve.
+#   [ ] /log print where message~"EVG-CALIBRA"
+#         -> [NEW-09] que umbral de conexiones aprendio, proxies y DoT.
+#   [ ] /ip firewall filter print where comment~"DETECTA exceso"
+#         -> el connection-limit debe reflejar el valor autocalibrado.
+#   [ ] /ip firewall address-list print count-only where list=EVG-NO-AUTOBLOCK
+#         -> [FP-03] union de infra exenta de autobloqueo (>1 = poblada).
 #   [ ] /log print where message~"EVG-RBL"
 #         -> si alguna publica esta en lista negra, y en cual
 #   [ ] /ip firewall address-list print where list=EVG-RBL-LISTADA
