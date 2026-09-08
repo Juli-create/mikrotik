@@ -106,6 +106,47 @@ Ahora si es capa fisica o autenticacion.
 **Log** (`show logging`)
 Aqui salen los `deregister`, los rogue ONU y los flapeos.
 
+## Capacidad de las ONU Huawei mas comunes
+
+El service profile debe declarar la capacidad **real** de la ONU. Si declara de
+mas, la config referencia puertos inexistentes y aborta con `Config Failed`.
+
+| Modelo | ETH | POTS | Tipo |
+|--------|-----|------|------|
+| HG8310M | 1 GE | 0 | SFU (bridge) |
+| HG8010H | 1 GE | 0 | SFU (bridge) |
+| HG8145V5 / EG8145V5 | 4 GE | **1** | HGU (router) + WiFi + USB |
+| HG8245H / HG8245Q2 | 4 GE | **2** | HGU (router) + WiFi |
+
+Ojo con el par HG8145V5 vs HG8245: casi todos los perfiles Huawei por defecto
+estan calcados de la **HG8245, que tiene 2 POTS**. La **HG8145V5 tiene 1**. Un
+perfil de 2 POTS sobre una HG8145V5 da `Mismatch`, y si hay voz mapeada al
+POTS 2, `Config Failed`.
+
+Si el firmware ofrece capacidad `auto`/`adaptive` en el perfil, usala: es lo
+mas sano cuando hay ONUs de varios fabricantes en el mismo PON.
+
+## Trampa: HGU Huawei en una OLT que no es Huawei
+
+Las **HGU** de Huawei (HG8145V5, HG8245, EG8145V5 — las que son router, no
+bridge) son ariscas con el aprovisionamiento OMCI de OLTs de terceros. Aceptan
+el registro, por eso las ves `ONLINE`, pero rechazan la configuracion WAN
+completa que les manda la OLT. Resultado: `Config Failed` **aunque los puertos
+del perfil esten bien declarados**.
+
+Como distinguirlo de un simple error de perfil: asigna a la ONU que falla una
+combinacion de perfiles que **ya funcione** en ese mismo PON. Si sigue en
+`Failed` con un perfil demostradamente bueno, no es el perfil, es el OMCI.
+
+La salida es no pelear el OMCI:
+
+1. Provisiona **minimo** desde la OLT: 1 T-CONT, 1 GEM, VLAN transparente al
+   puerto ETH1. Sin voz, sin multicast. Cuanto menos le mandes, menos hay que
+   pueda rechazar.
+2. Configura la WAN **en la ONU**, no en la OLT. Las HGU Huawei se administran
+   en `192.168.100.1` con el admin de fabrica `telecomadmin` /
+   `admintelecom`. Ahi armas el WAN con tu VLAN y modo (PPPoE o IPoE) a mano.
+
 ## Trampa: la alarma DDM de rx power baja en un puerto PON
 
 ```
