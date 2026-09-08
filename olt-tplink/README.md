@@ -44,13 +44,47 @@ historial del shell.
 
 ## Como leer el resultado
 
-El diagnostico esta ordenado por capas. Ve en orden:
+Primero mira el **estado** de cada ONU. Eso decide todo lo demas:
 
-**1. `show onu unauth` / `autofind` — esto parte el problema en dos:**
-- **Sale vacio** -> problema optico o de puerto PON. Ve al punto 2.
-- **Salen ONUs pero no autorizan** -> problema de autenticacion. Ve al punto 3.
+| ONLINE | Config  | Active   | Que significa |
+|--------|---------|----------|---------------|
+| si     | Success | Active   | La ONU trabaja |
+| si     | **Failed**  | Inactive | Registro OK, la config no aplico -> **problema de PERFIL** |
+| no     | -       | -        | Problema optico o de autenticacion |
 
-**2. Optica (`show interface pon`, `transceiver-info`)**
+`Match: Mismatch` por si solo **no** impide que la ONU trabaje: es un aviso de
+que el perfil declara un hardware distinto al que la ONU reporta por OMCI. El
+que la deja `Inactive` es `Config: Failed`.
+
+### Caso 1: ONLINE pero Config Failed / Inactive
+
+La fibra y la autenticacion estan bien. No pierdas tiempo midiendo potencias.
+
+La causa casi siempre es que el **service profile declara una capacidad fisica
+que la ONU no tiene**: N puertos Ethernet, N POTS, N T-CONT. La config
+referencia puertos inexistentes y aborta.
+
+1. Mira la capacidad **real** que reporta la ONU (`show onu capability`, o el
+   icono de detalle en la fila del GUI) y comparala con lo que declara el
+   perfil asignado.
+2. Si otra ONU del mismo PON ya trabaja, **copia su combinacion de perfiles**.
+   Es la prueba mas rapida: asignasela a la que falla y refresca.
+3. Un `line profile 0` / `service profile 0` suele ser el default vacio del
+   equipo y no sirve para dar servicio.
+4. Verifica el modelo exacto de la ONU. Un perfil de 4 puertos GE aplicado a
+   una ONU bridge de 1 puerto falla siempre. Ejemplos comunes:
+   `HG8310M` = 1 GE sin POTS; `HG8245`/`HG8145` = 4 GE + 2 POTS.
+
+Los prefijos del serial dicen el fabricante: `HWTC` = Huawei, `ALCL` =
+Alcatel/Nokia, `ZTEG` = ZTE, `TPLG` = TP-Link. Si fallan todas las de un
+fabricante y funcionan las de otro, es un perfil que no encaja con ese
+hardware, no un problema de red.
+
+### Caso 2: la ONU no llega a ONLINE
+
+Ahora si es capa fisica o autenticacion.
+
+**Optica** (`show interface pon`, `transceiver-info`)
 - ¿El puerto esta administrativamente arriba?
 - Tx de la OLT: normal ~ +2 a +5 dBm.
 - Rx en la ONU: debe estar entre **-8 y -27 dBm**. Fuera de ahi no registra o
@@ -58,27 +92,19 @@ El diagnostico esta ordenado por capas. Ve en orden:
 - Causas tipicas: LED LOS encendido, conector sucio (limpiar con alcohol
   isopropilico), splitter mal balanceado, fibra cortada, fusion mala.
 
-**3. Autenticacion (`show gpon authentication-mode`)**
-Causa #1 de "la detecta pero no sube": el modo de la OLT (SN / LOID /
-LOID+password) no coincide con el que trae la ONU de fabrica. Si vas por SN,
-confirma que sea el de la etiqueta.
-
-**4. Perfiles (`show gpon profile ...`)**
-Sin `line profile` y `service profile` (DBA + T-CONT + GEM) creados y asignados,
-la ONU puede autorizar y quedar sin servicio, o rebotar. Crea los perfiles
-**antes** de autorizar.
-
-**5. Log (`show logging`)**
-Aqui salen los `deregister`, los rogue ONU y los flapeos.
-
-Otros que se ven seguido:
-- SN ya registrado en otro puerto PON de la misma OLT: la autorizacion falla en
-  silencio. Busca duplicados.
+**Autenticacion** (`show gpon authentication-mode`, `show onu unauth`)
+- ¿Aparece en `unauth`/`autofind`? Si aparece, la fibra esta bien y el
+  problema es el modo de auth (SN / LOID / LOID+password), que debe coincidir
+  con el que trae la ONU de fabrica.
+- SN ya registrado en otro puerto PON de la misma OLT: la autorizacion falla
+  en silencio. Busca duplicados.
 - Limite de 128 ONUs por puerto alcanzado.
 - **Rogue ONU** (transmite fuera de su timeslot) tumbando el PON entero: si
   *ninguna* ONU sube de golpe en un puerto que antes andaba, desconecta ramas
   del splitter una por una.
-- Firmware de ONU con OMCI incompatible (tipico con ONUs de otro fabricante).
+
+**Log** (`show logging`)
+Aqui salen los `deregister`, los rogue ONU y los flapeos.
 
 ## Sobre la sintaxis de los comandos
 

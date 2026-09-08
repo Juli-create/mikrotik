@@ -54,40 +54,58 @@ done
 read -r -d '' COMANDOS_DEFAULT <<'CMDS'
 # --- identidad y estado general ---
 show system-info
-show system resource
 show running-config
 
-# --- CAPA 1: puertos PON y optica ---
-# ¿Estan los puertos administrativamente arriba? ¿Que potencia transmite la OLT?
-show interface pon
-show interface pon 1/0/1
-show interface pon 1/0/1 transceiver-info
-show interface pon 1/0/2 transceiver-info
-
-# --- CAPA 2: ¿la OLT VE las ONUs? ---
-# Esto es lo que parte el problema en dos:
-#   sale algo -> problema de autenticacion/perfiles
-#   sale vacio -> problema optico o de puerto
-show onu unauth
-show gpon onu-authentication-info
-show gpon onu autofind
-
-# --- CAPA 3: ONUs ya registradas y su estado ---
+# --- CAPA A: ¿en que estado quedaron las ONUs? ---
+# Lee las columnas en este orden:
+#   ONLINE + Config Success + Active            -> la ONU trabaja
+#   ONLINE + Config FAILED  + Inactive          -> registro OK, la config no
+#                                                  aplico. Es problema de
+#                                                  PERFIL, no de fibra. Ve a B.
+#   no aparece / OFFLINE                        -> problema optico o de auth.
+#                                                  Ve a C y D.
+#
+# "Match: Mismatch" por si solo NO impide que la ONU trabaje: es un aviso de
+# que el perfil declara un hardware distinto al que la ONU reporta por OMCI.
+# El que la deja Inactive es "Config: Failed".
 show onu all
 show onu status
 show gpon onu state
-show onu optical-info
 
-# --- CAPA 4: autenticacion y perfiles ---
-# Causa #1 de "la detecta pero no sube": el modo de auth de la OLT (SN / LOID /
-# LOID+password) no coincide con lo que trae la ONU de fabrica.
-show gpon authentication-mode
+# --- CAPA B: capacidad REAL de la ONU vs. lo que declara el perfil ---
+# Aqui esta la causa de Mismatch/Config Failed: el service profile declara N
+# puertos ETH/POTS/T-CONT y la ONU responde que no los tiene, asi que la
+# config referencia puertos inexistentes y aborta.
+#
+# Ajusta <pon> <onu> a las que te fallan (p.ej. 5 0 / 5 1).
+show onu capability 5 0
+show onu capability 5 1
+show onu detail-info 5 0
+show onu detail-info 5 1
+show onu config-failed 5 0
+show onu failed-configuration
+
+# Que declara cada perfil. Compara el de la ONU que FALLA contra el de la que
+# FUNCIONA: si una combinacion ya trabaja en el mismo PON, es la base a copiar.
 show gpon profile line
 show gpon profile service
 show gpon profile dba
 
-# --- CAPA 5: rastro de que paso ---
-# Aqui salen los deregister, los rogue ONU y los flapeos.
+# --- CAPA C: ¿la OLT VE las ONUs que no aparecen? ---
+show onu unauth
+show gpon onu-authentication-info
+show gpon onu autofind
+show gpon authentication-mode
+
+# --- CAPA D: optica y puertos PON ---
+# Solo relevante si la ONU no llega a ONLINE. Si ya esta ONLINE, la fibra
+# esta bien y este bloque no te dice nada util.
+show interface pon
+show onu optical-info
+show interface pon 1/0/5 transceiver-info
+
+# --- CAPA E: rastro de que paso ---
+# Deregister, rogue ONU, flapeos, y el motivo de las configuraciones fallidas.
 show logging buffer
 show logging
 CMDS
