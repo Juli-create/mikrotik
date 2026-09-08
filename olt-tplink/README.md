@@ -106,6 +106,34 @@ Ahora si es capa fisica o autenticacion.
 **Log** (`show logging`)
 Aqui salen los `deregister`, los rogue ONU y los flapeos.
 
+## Trampa: la alarma DDM de rx power baja en un puerto PON
+
+```
+Port Gpon1/0/5 SFP Module rx power low alarm
+Port Gpon1/0/5 SFP Module rx power recover from the low alarm threshold
+```
+
+**Por si sola no indica un problema de fibra.** En un puerto GPON el Rx del SFP
+de la OLT es la rafaga upstream de las ONUs. Si ninguna ONU esta transmitiendo,
+el Rx es practicamente cero y la OLT dispara la alarma. Cuando una ONU conecta,
+sube y "recupera".
+
+Para saber si es causa o consecuencia, **mira el orden de los eventos**:
+
+| Orden | Lectura |
+|-------|---------|
+| ONU `connected` -> luego `rx power recover` | Normal. La alarma era por ausencia de ONUs. Consecuencia. |
+| `rx power recover` -> luego ONU `connected` | La fibra se recupero y por eso subio la ONU. Causa. |
+
+Esta alarma solo significa algo si salta **mientras hay ONUs activas
+transmitiendo**.
+
+Lo que si importa son los **dBm reales por ONU**, no los umbrales ni el
+agregado del puerto PON. Y un `was connected` en el log implica que antes
+estuvo desconectada: filtra el log por esa SN y cuenta los eventos. Si
+`connected`/`disconnected` se repite cada pocos minutos, es flapeo real y ahi
+si toca revisar conector, fusion y potencia de esa rama.
+
 ## Sobre la sintaxis de los comandos
 
 La sintaxis exacta cambia entre versiones de firmware de la 7001. Si un comando
