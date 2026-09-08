@@ -1,0 +1,2 @@
+# Salidas del recolector: llevan el running-config de la OLT
+diagnostico-olt-*.txt
